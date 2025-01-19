@@ -1,21 +1,14 @@
-from collections import defaultdict
-from flask import Flask, request, jsonify
-from collections import defaultdict
-import io
 from flask_cors import CORS
 from flask_mysqldb import MySQL
-from werkzeug.security import generate_password_hash, check_password_hash
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
-from werkzeug.utils import secure_filename
-import uuid
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from googleapiclient.http import MediaIoBaseUpload
+from werkzeug.security import check_password_hash
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required
+from cloudinary.uploader import upload as cloudinary_upload
+from cloudinary.exceptions import Error as CloudinaryError
+from cloudinary.api import delete_resources
 from datetime import datetime, timedelta
-
 from dotenv import load_dotenv
 import os
+from flask import Flask, request, jsonify
 
 load_dotenv()
 
@@ -30,6 +23,18 @@ app.config['MYSQL_PASSWORD'] = os.getenv('MYSQL_PASSWORD')
 app.config['MYSQL_DB'] = os.getenv('MYSQL_DB')
 app.config['MYSQL_PORT'] = int(os.getenv('MYSQL_PORT'))  # Cast port to integer
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
+cloudinary_config = {
+    "api_key": os.getenv("CLOUDINARY_API_KEY"),
+    "api_secret": os.getenv("CLOUDINARY_API_SECRET"),
+    "cloud_name": os.getenv("CLOUDINARY_CLOUD_NAME"),
+}
+
+# Initialize Backblaze B2 bucket (pseudo-code)
+
+
+application_key_id = os.getenv("B2_KEY_ID")
+application_key = os.getenv("B2_APPLICATION_KEY")
+
 
 mysql = MySQL(app)
 
@@ -58,54 +63,42 @@ def login():
         token = create_access_token(identity=admin[1], expires_delta=expires)
         return jsonify({'token': token}), 200
 
-# Add product
-SCOPES = ['https://www.googleapis.com/auth/drive.file']
-credentials = service_account.Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
-service = build('drive', 'v3', credentials=credentials)
-
-# Function to upload file to Google Drive
-def upload_image_to_drive(file):
+def delete_from_cloudinary(public_id):
     try:
-        # Secure the filename
-        filename = secure_filename(file.filename)
+        # Deletes the resource by its public_id
+        response = delete_resources(public_id)
+        print(f"Cloudinary Delete Response: {response}")
+        return response.get("deleted", {}).get(public_id) == "deleted"
+    except CloudinaryError as e:
+        print(f"Error deleting from Cloudinary: {e}")
+        return False
 
-        # Create an in-memory file-like object from the uploaded file
-        file_stream = io.BytesIO(file.read())  # Read the file content into memory
 
-        # Prepare the media upload for Google Drive
-        media = MediaIoBaseUpload(file_stream, mimetype=file.mimetype)
-        file_metadata = {'name': filename, 'parents': ['1mAUUgrtfUpsTWOaBaM8g0gZQAaURppG9']}
-        
-        # Upload the file to Google Drive
-        uploaded_file = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id'
-        ).execute()
+def upload_image_to_storage(image_file):
+    """
+    Upload an image to Cloudinary or Backblaze B2 based on the configured storage type.
 
-        # Change permissions to make it publicly accessible
-        permission_body = {
-            'role': 'reader',
-            'type': 'anyone'
-        }
-        service.permissions().create(
-            fileId=uploaded_file.get('id'),
-            body=permission_body,
-        ).execute()
+    Args:
+        image_file: The uploaded file from the request.
 
-        # Get the file's Google Drive ID and construct the URL
-        file_id = uploaded_file.get('id')
-        direct_image_url = f"https://drive.google.com/uc?id={file_id}"
+    Returns:
+        tuple: (image_url, file_id) if successful, otherwise (None, None).
+    """
+  # Default to Cloudinary
 
-        return direct_image_url, file_id  # Return both the URL and file ID
+    try:
 
-    except Exception as e:
-        print(f"Error uploading image: {e}")
+            response = cloudinary_upload(image_file, folder="dfootprint")
+            image_url = response.get("secure_url")
+            file_id = response.get("public_id")
+            print("cloudinary", image_url, file_id)
+            return image_url, file_id
+
+    except (CloudinaryError, Exception) as e:
+        print(f"Error uploading image to Cloundinary: {e}")
         return None, None
 
 
-
-created_at = datetime.now()
 # Add product (with image upload to Google Drive)
 @app.route('/api/products/new', methods=['POST'])
 def add_product():
@@ -116,8 +109,8 @@ def add_product():
         
         image = request.files['image']
 
-        # Upload the image to Google Drive
-        image_url, file_id = upload_image_to_drive(image)
+        # Upload the image to the configured storage
+        image_url, file_id = upload_image_to_storage(image)
         if not image_url or not file_id:
             return jsonify({'error': 'Failed to upload image'}), 500
         
@@ -146,7 +139,6 @@ def add_product():
     except Exception as e:
         print(f"Error adding product: {e}")
         return jsonify({'error': 'An error occurred while adding the product'}), 500
-
     
 @app.route('/api/products', methods=['GET'])
 def get_products():
@@ -190,13 +182,7 @@ def update_product(product_id):
     return jsonify({'message': 'Product updated successfully'}), 200
 
 
-def delete_image_from_drive(file_id):
-    try:
-        service.files().delete(fileId=file_id).execute()
-        return True
-    except Exception as e:
-        print(f"Error deleting file: {e}")
-        return False
+
 
 @app.route('/api/products/delete/<int:product_id>', methods=['DELETE'])
 def delete_product(product_id):
@@ -214,7 +200,7 @@ def delete_product(product_id):
         print(file_id)
 
         # Delete the file from Google Drive
-        if file_id and not delete_image_from_drive(file_id):
+        if file_id and not delete_from_cloudinary(file_id):
             return jsonify({'error': 'Failed to delete image from Google Drive'}), 500
 
         # Delete the product from the database
