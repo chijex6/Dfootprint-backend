@@ -34,7 +34,7 @@ app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
 mysql = MySQL(app)
 
 # Google Drive API credentials file
-CREDENTIALS_FILE = '/etc/secrets/auth.json'
+CREDENTIALS_FILE = './etc/secrets/auth.json'
 CORS(app)
 # JWT Configuration
 jwt = JWTManager(app)
