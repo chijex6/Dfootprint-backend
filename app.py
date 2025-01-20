@@ -105,6 +105,7 @@ def add_product():
     try:
         # Check if the request contains the image file
         if 'image' not in request.files:
+            print("Failed no image")
             return jsonify({'error': 'No image provided'}), 400
         
         image = request.files['image']
