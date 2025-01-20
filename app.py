@@ -44,6 +44,11 @@ CORS(app)
 # JWT Configuration
 jwt = JWTManager(app)
 
+@app.route('/', methods=['GET'])
+def home():
+    message = f"Welcome to the D'FOOTPRINTBackend API! This is for testing our API."
+    return jsonify({'message': message}), 200
+
 @app.route('/login', methods=['POST'])
 def login():
     data = request.json
