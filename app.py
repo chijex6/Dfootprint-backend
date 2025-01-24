@@ -47,6 +47,19 @@ CORS(app)
 # JWT Configuration
 jwt = JWTManager(app)
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """
+    A health check endpoint that returns the status of the service.
+    """
+    current_time = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    response = {
+        "status": "healthy",
+        "message": "Service is running smoothly",
+        "timestamp": current_time
+    }
+    return jsonify(response), 200
+
 @app.route('/login', methods=['POST'])
 def login():
     data = request.json
