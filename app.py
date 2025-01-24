@@ -9,6 +9,7 @@ from reciptGen import create_invoice_in_memory
 from datetime import datetime
 from cloudinary.api import delete_resources
 from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 import os
 from flask import Flask, request, jsonify, send_file
@@ -47,16 +48,26 @@ CORS(app)
 # JWT Configuration
 jwt = JWTManager(app)
 
+import time
+
+start_time = time.time()
+
 @app.route('/health', methods=['GET'])
 def health_check():
-    """
-    A health check endpoint that returns the status of the service.
-    """
-    response = {
-        "status": "healthy",
-        "message": "Service is running smoothly"
-    }
-    return jsonify(response), 200
+    uptime = time.time() - start_time
+    return jsonify({
+        "status": "success",
+        "message": "Backend is live and running!",
+        "timestamp": datetime.datetime.now().isoformat(),
+        "system": {
+            "os": platform.system(),
+            "os_version": platform.version(),
+            "architecture": platform.architecture()[0],
+            "python_version": platform.python_version()
+        },
+        "uptime_seconds": round(uptime, 2)
+    }), 200
+
 
 @app.route('/login', methods=['POST'])
 def login():
@@ -117,7 +128,6 @@ def generate_invoice():
     try:
         # Parse the order payload from the request
         order = request.get_json()
-        print(order)
 
         # Format the data for the invoice generator
         invoice_data = {
@@ -145,8 +155,6 @@ def generate_invoice():
         }
 
         order_id = str(order['id'])
-        print(order["items"])
-
         # Format your data here if needed
         pdf_buffer = create_invoice_in_memory(invoice_data)
         response = send_file(
@@ -225,7 +233,67 @@ def get_products():
 # Mock database for demonstration
 orders_db = []
 
-from datetime import datetime
+@app.route('/api/orders/metadata', methods=['GET'])
+def get_order_metadata():
+    try:
+        # Get the order_id from the query parameters
+        order_id = request.args.get('order_id')
+
+        # Validate the order_id format
+        if not order_id or len(order_id) != 12 or not order_id.startswith("ORD-"):
+            return jsonify({"error": "Invalid Order ID format."}), 400
+
+        # Check if the order exists in the orders table
+        cursor = mysql.connection.cursor()
+        cursor.execute("SELECT status, date_created, estimated_time FROM orders WHERE order_id = %s", (order_id,))
+        order_metadata = cursor.fetchone()
+
+        if not order_metadata:
+            print("Order ID not found.")
+            return jsonify({"error": "Order ID not found."}), 404
+
+        # Extract order metadata
+        status, date_created, estimated_time = order_metadata
+
+        # Query the tracking details for the given order_id
+        cursor.execute('''
+            SELECT 
+                customer_name, customer_email, customer_contact, 
+                product_name, product_quantity, total_amount
+            FROM track 
+            WHERE order_id = %s
+        ''', (order_id,))
+        tracking_data = cursor.fetchall()
+
+        if not tracking_data:
+            return jsonify({"error": "No tracking data found for this Order ID."}), 404
+
+        # Build the response
+        response = {
+            "order_id": order_id,
+            "status": status,
+            "date_created": date_created.strftime('%Y-%m-%d %H:%M:%S'),
+            "estimated_time": estimated_time.strftime('%Y-%m-%d %H:%M:%S') if estimated_time else None,
+            "tracking_data": [
+                {
+                    "name": row[0],
+                    "email": row[1],
+                    "contact": row[2],
+                    "product": row[3],
+                    "quantity": row[4],
+                    "total": row[5]
+                }
+                for row in tracking_data
+            ]
+        }
+
+        cursor.close()
+        return jsonify(response), 200
+
+    except Exception as e:
+        print(f"Error fetching order metadata: {e}")
+        return jsonify({"error": "An internal server error occurred."}), 500
+
 
 @app.route('/api/orders/metadata', methods=['POST'])
 def add_order_metadata():
@@ -244,44 +312,60 @@ def add_order_metadata():
                 break
 
         # Extract request data
-        status = request.json.get("status", "Pending")
-        date_created_iso = request.json.get("date_created", datetime.utcnow().isoformat())
-        estimated_time_iso = request.json.get("estimated_time", None)
-
-        # Convert ISO 8601 datetime to MySQL-compatible format
-        try:
-            date_created = datetime.fromisoformat(date_created_iso.replace("Z", "+00:00")).strftime('%Y-%m-%d %H:%M:%S')
-        except ValueError:
-            return jsonify({'error': f"Invalid date_created format: {date_created_iso}"}), 400
-
-        if estimated_time_iso:
-            try:
-                estimated_time = datetime.fromisoformat(estimated_time_iso.replace("Z", "+00:00")).strftime('%Y-%m-%d %H:%M:%S')
-            except ValueError:
-                return jsonify({'error': f"Invalid estimated_time format: {estimated_time_iso}"}), 400
-        else:
-            estimated_time = None
+        customer_name = request.json.get("name")
+        customer_email = request.json.get("email")
+        customer_contact = request.json.get("number")
+        cart_items = request.json.get("items", [])  # Array of cart items
 
         # Validate required fields
-        if not status or not date_created:
+        if not customer_name or not customer_email or not cart_items:
             return jsonify({'error': 'Missing required fields'}), 400
 
-        # Save order metadata to the database
+        # Save order metadata to the orders table
         cursor = mysql.connection.cursor()
         cursor.execute('''INSERT INTO orders (order_id, status, date_created, estimated_time)
-                          VALUES (%s, %s, %s, %s)''', 
-                       (order_id, status, date_created, estimated_time))
+                          VALUES (%s, %s, NOW(), NULL)''', 
+                       (order_id, "Pending"))
         mysql.connection.commit()
+
+        # Add tracking data for each item in the cart
+        for product in cart_items:
+            try:
+                # Extract product details
+                product_name = product.get("name")
+                product_size = product.get("size")
+                product_quantity = product.get("quantity")
+                total_amount = product.get("total", 0.0)
+                size = f"{product_size}, {product.get('fit', '')}"
+                # Validate product details
+                if not product_name or not product_size:
+                    continue  # Skip invalid product entries
+
+                # Insert the product into the track table
+                try:
+                 cursor.execute('''INSERT INTO track 
+                                  (order_id, customer_name, customer_email, customer_contact, 
+                                   product_name, product_size, total_amount, product_quantity, status)
+                                  VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''', 
+                               (order_id, customer_name, customer_email, customer_contact, 
+                                product_name, size, total_amount, product_quantity, "Confirmed"))
+                except Exception as e:
+                    print(f"Error saving tracking data for product: {product}, error: {e}")
+                    return jsonify({'error': 'An error occurred while adding order metadata and tracking data'}), 500
+            except Exception as e:
+                print(f"Error saving tracking data for product: {product}, error: {e}")
+        mysql.connection.commit()
+
         cursor.close()
 
         return jsonify({
-            "message": "Order metadata saved successfully",
+            "message": "Order metadata and tracking data saved successfully",
             "order_id": order_id,
         }), 201
 
     except Exception as e:
-        print(f"Error adding order metadata: {e}")
-        return jsonify({'error': 'An error occurred while adding order metadata'}), 500
+        print(f"Error adding order metadata and tracking data: {e}")
+        return jsonify({'error': 'An error occurred while adding order metadata and tracking data'}), 500
 
 
 # Update product
