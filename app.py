@@ -4,12 +4,14 @@ from werkzeug.security import check_password_hash
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required
 from cloudinary.uploader import upload as cloudinary_upload
 from cloudinary.exceptions import Error as CloudinaryError
+import uuid
+from reciptGen import create_invoice_in_memory
+from datetime import datetime
 from cloudinary.api import delete_resources
 from datetime import datetime, timedelta
-import datetime
 from dotenv import load_dotenv
 import os
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 
 load_dotenv()
 
@@ -44,26 +46,6 @@ CREDENTIALS_FILE = '/etc/secrets/auth.json'
 CORS(app)
 # JWT Configuration
 jwt = JWTManager(app)
-
-@app.route('/', methods=['GET'])
-def home():
-    message = f"Welcome to the D'FOOTPRINTBackend API! This is for testing our API."
-    return jsonify({'message': message}), 200
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """
-    A health check endpoint that returns the status of the service.
-    """
-    current_time = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-    response = {
-        "status": "healthy",
-        "message": "Service is running smoothly",
-        "timestamp": current_time
-    }
-    return jsonify(response), 200
-
-
 
 @app.route('/login', methods=['POST'])
 def login():
@@ -119,6 +101,57 @@ def upload_image_to_storage(image_file):
         print(f"Error uploading image to Cloundinary: {e}")
         return None, None
 
+@app.route("/api/orders/invoice", methods=["POST"])
+def generate_invoice():
+    try:
+        # Parse the order payload from the request
+        order = request.get_json()
+        print(order)
+
+        # Format the data for the invoice generator
+        invoice_data = {
+            'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'id': str(order['id']),  # Ensure the ID is a string
+            'name': order['name'],
+            'email': order['email'],
+            'number': str(order['number']),  # Convert number to string
+            'Delivery Company': order['Delivery Company'],
+            'State': order['State'],
+            'Location': order['Location'],
+            'Pickup Address': order.get('Pickup Address', "N/A"),  # Handle missing pickup address
+            'items': [
+                {
+                    'name': item['name'],
+                    'size': str(item['size']),  # Convert size to string
+                    'unit_price': f"{float(item['unit_price']):.2f}",  # Convert string to float, then format
+                    'total': f"{float(item['total']):.2f}"  # Convert total to float, then format
+                }
+                for item in order['items']
+            ],
+            'subtotal': f"{float(order['subtotal']):.2f}",  # Convert subtotal to float, then format
+            'tax': f"{float(order['tax']):.2f}",  # Convert tax to float, then format
+            'total': f"{float(order['total']):.2f}"  # Convert total to float, then format
+        }
+
+        order_id = str(order['id'])
+        print(order["items"])
+
+        # Format your data here if needed
+        pdf_buffer = create_invoice_in_memory(invoice_data)
+        response = send_file(
+            pdf_buffer,
+            as_attachment=True,
+            download_name=f"Invoice_{order_id}.pdf",
+            mimetype='application/pdf'
+        )
+        response.headers['Access-Control-Expose-Headers'] = 'Content-Disposition'
+        response.headers['Content-Disposition'] = f'attachment; filename="Invoice_{order_id}.pdf"'
+        return response
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 
 # Add product (with image upload to Google Drive)
 @app.route('/api/products/new', methods=['POST'])
@@ -126,7 +159,6 @@ def add_product():
     try:
         # Check if the request contains the image file
         if 'image' not in request.files:
-            print("Failed no image")
             return jsonify({'error': 'No image provided'}), 400
         
         image = request.files['image']
@@ -178,6 +210,68 @@ def get_products():
     except Exception as e:
         print(f"Error fetching products: {e}")
         return jsonify({'error': 'Failed to fetch products'}), 500
+
+# Mock database for demonstration
+orders_db = []
+
+from datetime import datetime
+
+@app.route('/api/orders/metadata', methods=['POST'])
+def add_order_metadata():
+    try:
+        # Generate a unique order_id
+        while True:
+            order_id = f"ORD-{uuid.uuid4().hex[:8].upper()}"
+
+            # Check if the generated order_id already exists
+            cursor = mysql.connection.cursor()
+            cursor.execute("SELECT COUNT(*) FROM orders WHERE order_id = %s", (order_id,))
+            existing_order_count = cursor.fetchone()[0]
+            cursor.close()
+
+            if existing_order_count == 0:
+                break
+
+        # Extract request data
+        status = request.json.get("status", "Pending")
+        date_created_iso = request.json.get("date_created", datetime.utcnow().isoformat())
+        estimated_time_iso = request.json.get("estimated_time", None)
+
+        # Convert ISO 8601 datetime to MySQL-compatible format
+        try:
+            date_created = datetime.fromisoformat(date_created_iso.replace("Z", "+00:00")).strftime('%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            return jsonify({'error': f"Invalid date_created format: {date_created_iso}"}), 400
+
+        if estimated_time_iso:
+            try:
+                estimated_time = datetime.fromisoformat(estimated_time_iso.replace("Z", "+00:00")).strftime('%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                return jsonify({'error': f"Invalid estimated_time format: {estimated_time_iso}"}), 400
+        else:
+            estimated_time = None
+
+        # Validate required fields
+        if not status or not date_created:
+            return jsonify({'error': 'Missing required fields'}), 400
+
+        # Save order metadata to the database
+        cursor = mysql.connection.cursor()
+        cursor.execute('''INSERT INTO orders (order_id, status, date_created, estimated_time)
+                          VALUES (%s, %s, %s, %s)''', 
+                       (order_id, status, date_created, estimated_time))
+        mysql.connection.commit()
+        cursor.close()
+
+        return jsonify({
+            "message": "Order metadata saved successfully",
+            "order_id": order_id,
+        }), 201
+
+    except Exception as e:
+        print(f"Error adding order metadata: {e}")
+        return jsonify({'error': 'An error occurred while adding order metadata'}), 500
+
 
 # Update product
 @app.route('/api/products/<product_id>', methods=['PUT'])
