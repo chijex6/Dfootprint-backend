@@ -58,7 +58,6 @@ def health_check():
     return jsonify({
         "status": "success",
         "message": "Backend is live and running!",
-        "timestamp": datetime.datetime.now().isoformat(),
         "system": {
             "os": platform.system(),
             "os_version": platform.version(),
