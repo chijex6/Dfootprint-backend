@@ -1,3 +1,4 @@
+import platform
 from flask_cors import CORS
 from flask_mysqldb import MySQL
 from werkzeug.security import check_password_hash
