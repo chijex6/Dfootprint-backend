@@ -52,11 +52,9 @@ def health_check():
     """
     A health check endpoint that returns the status of the service.
     """
-    current_time = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
     response = {
         "status": "healthy",
-        "message": "Service is running smoothly",
-        "timestamp": current_time
+        "message": "Service is running smoothly"
     }
     return jsonify(response), 200
 
