@@ -1,4 +1,3 @@
-import platform
 from flask_cors import CORS
 from flask_mysqldb import MySQL
 from werkzeug.security import check_password_hash
@@ -12,6 +11,7 @@ from cloudinary.api import delete_resources
 from datetime import datetime, timedelta
 from datetime import datetime
 from dotenv import load_dotenv
+import platform
 import os
 from flask import Flask, request, jsonify, send_file
 
@@ -233,6 +233,22 @@ def get_products():
 # Mock database for demonstration
 orders_db = []
 
+@app.route('/api/orders', methods=['GET'])
+def get_order():
+    try:
+        order_id = request.args.get('order_id')
+        if not order_id or len(order_id) != 12 or not order_id.startswith("ORD-"):
+            return jsonify({"error": "Invalid Order ID format."}), 400
+        cursor = mysql.connection.cursor()
+        cursor.execute("SELECT product_name, product_size, product_quantity FROM track WHERE order_id = %s", (order_id,))
+        data = cursor.fetchall()
+        products = [{'name': row[0], 'size': row[1], 'quantity': row[2]} for row in data]
+        cursor.close()
+        return jsonify(products), 200
+    except Exception as e:
+        print(f"Error fetching orders: {e}")
+        return jsonify({'error': 'Failed to fetch orders'}), 500
+
 @app.route('/api/orders/metadata', methods=['GET'])
 def get_order_metadata():
     try:
@@ -294,78 +310,235 @@ def get_order_metadata():
         print(f"Error fetching order metadata: {e}")
         return jsonify({"error": "An internal server error occurred."}), 500
 
-
-@app.route('/api/orders/metadata', methods=['POST'])
-def add_order_metadata():
+@app.route('/api/products/manage', methods=['GET', 'POST'])
+def manage_products():
     try:
-        # Generate a unique order_id
-        while True:
-            order_id = f"ORD-{uuid.uuid4().hex[:8].upper()}"
-
-            # Check if the generated order_id already exists
+        if request.method == 'GET':
+            # Fetch orders and restructure them to match frontend expectations
             cursor = mysql.connection.cursor()
-            cursor.execute("SELECT COUNT(*) FROM orders WHERE order_id = %s", (order_id,))
-            existing_order_count = cursor.fetchone()[0]
+            cursor.execute('''
+              SELECT 
+                o.order_id AS product_id, 
+                o.status, 
+                o.batch,
+                t.customer_name, 
+                t.customer_contact, 
+                t.product_name,
+                o.date_created, 
+                t.customer_email
+            FROM orders o
+            LEFT JOIN (
+                SELECT 
+                    order_id, 
+                    MAX(customer_name) AS customer_name, 
+                    MAX(customer_contact) AS customer_contact, 
+                    MAX(product_name) AS product_name,
+                    MAX(customer_email) AS customer_email
+                FROM track
+                GROUP BY order_id
+            ) t ON o.order_id = t.order_id
+            ORDER BY o.batch IS NULL DESC, o.batch, o.date_created DESC;
+            ''')
+            data = cursor.fetchall()
+
+            # Flatten and structure data
+            products = [
+                {
+                    "product_id": row[0],
+                    "status": row[1],
+                    "batch": row[2],
+                    "date_created": row[6].strftime('%Y-%m-%d %H:%M:%S'),
+                    "tracking_data": {
+                        "customer_name": row[3],
+                        "contact": row[4],
+                        "items": [row[5]],
+                        "email": row[7]
+                    },
+                }
+                for row in data
+            ]
+
             cursor.close()
+            return jsonify(products), 200
 
-            if existing_order_count == 0:
-                break
+        elif request.method == 'POST':
+            # Handle status updates for products
+            data = request.json
+            product_ids = data.get("product_ids", [])
+            new_status = data.get("status")
 
-        # Extract request data
-        customer_name = request.json.get("name")
-        customer_email = request.json.get("email")
-        customer_contact = request.json.get("number")
-        cart_items = request.json.get("items", [])  # Array of cart items
+            if not product_ids or not new_status:
+                return jsonify({"error": "Product IDs and status are required."}), 400
 
-        # Validate required fields
-        if not customer_name or not customer_email or not cart_items:
-            return jsonify({'error': 'Missing required fields'}), 400
+            cursor = mysql.connection.cursor()
+            cursor.execute('''
+                UPDATE orders 
+                SET status = %s 
+                WHERE order_id IN (%s)
+            ''' % (','.join(['%s'] * len(product_ids))), (new_status, *product_ids))
 
-        # Save order metadata to the orders table
-        cursor = mysql.connection.cursor()
-        cursor.execute('''INSERT INTO orders (order_id, status, date_created, estimated_time)
-                          VALUES (%s, %s, NOW(), NULL)''', 
-                       (order_id, "Pending"))
-        mysql.connection.commit()
-
-        # Add tracking data for each item in the cart
-        for product in cart_items:
-            try:
-                # Extract product details
-                product_name = product.get("name")
-                product_size = product.get("size")
-                product_quantity = product.get("quantity")
-                total_amount = product.get("total", 0.0)
-                size = f"{product_size}, {product.get('fit', '')}"
-                # Validate product details
-                if not product_name or not product_size:
-                    continue  # Skip invalid product entries
-
-                # Insert the product into the track table
-                try:
-                 cursor.execute('''INSERT INTO track 
-                                  (order_id, customer_name, customer_email, customer_contact, 
-                                   product_name, product_size, total_amount, product_quantity, status)
-                                  VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''', 
-                               (order_id, customer_name, customer_email, customer_contact, 
-                                product_name, size, total_amount, product_quantity, "Confirmed"))
-                except Exception as e:
-                    print(f"Error saving tracking data for product: {product}, error: {e}")
-                    return jsonify({'error': 'An error occurred while adding order metadata and tracking data'}), 500
-            except Exception as e:
-                print(f"Error saving tracking data for product: {product}, error: {e}")
-        mysql.connection.commit()
-
-        cursor.close()
-
-        return jsonify({
-            "message": "Order metadata and tracking data saved successfully",
-            "order_id": order_id,
-        }), 201
+            mysql.connection.commit()
+            cursor.close()
+            return jsonify({"message": "Products updated successfully."}), 200
 
     except Exception as e:
-        print(f"Error adding order metadata and tracking data: {e}")
-        return jsonify({'error': 'An error occurred while adding order metadata and tracking data'}), 500
+        print(f"Error managing products: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+
+# Route: Create a new batch
+@app.route('/api/products/create_batch', methods=['POST'])
+def create_batch():
+    try:
+        batch_name = request.json.get("batch_name")
+        product_ids = request.json.get("product_ids", [])
+
+        if not batch_name or not product_ids:
+            return jsonify({"message": "Batch name and product IDs are required"}), 400
+
+        cursor = mysql.connection.cursor()
+
+        # Link products to the batch in batch_products table
+        for product_id in product_ids:
+            cursor.execute(
+                """Update orders 
+                SET batch = %s
+                WHERE order_id = %s """,
+                (batch_name, product_id),
+            )
+
+        mysql.connection.commit()
+        cursor.close()
+
+        return jsonify({"message": "Batch created successfully"}), 201
+    except Exception as e:
+        print(f"Error creating batch: {e}")
+        return jsonify({"message": "Failed to create batch"}), 500
+
+
+# Route: Update batch status
+@app.route('/api/products/update_batch_status', methods=['POST'])
+def update_batch_status():
+    try:
+        batch_name = request.json.get("batch_name")
+        status = request.json.get("status")
+
+        if not batch_name or not status:
+            return jsonify({"message": "Batch name and status are required"}), 400
+
+        cursor = mysql.connection.cursor()
+        if batch_name == "New Batch":
+            cursor.execute(
+                "UPDATE orders SET status = %s WHERE batch IS NULL", (status,)
+            )
+        else:
+            cursor.execute(
+                "UPDATE orders SET status = %s WHERE batch = %s", (status, batch_name)
+            )
+
+        mysql.connection.commit()
+        cursor.close()
+
+
+        return jsonify({"message": "Batch status updated successfully"}), 200
+    except Exception as e:
+        print(f"Error updating batch status: {e}")
+        return jsonify({"message": "Failed to update batch status"}), 500
+
+
+# Route: Update product status
+@app.route('/api/products/update_status', methods=['POST'])
+def update_product_status():
+    try:
+        product_id = request.json.get("product_id")
+        status = request.json.get("status")
+
+        if not product_id or not status:
+            return jsonify({"message": "Product ID and status are required"}), 400
+
+        cursor = mysql.connection.cursor()
+
+        # Update the product status
+        cursor.execute(
+            "UPDATE orders SET status = %s WHERE order_id = %s", (status, product_id)
+        )
+
+        mysql.connection.commit()
+        cursor.close()
+
+        return jsonify({"message": "Product status updated successfully"}), 200
+    except Exception as e:
+        print(f"Error updating product status: {e}")
+        return jsonify({"message": "Failed to update product status"}), 500
+
+@app.route('/api/orders/details', methods=['GET'])
+def get_order_details():
+    """
+    Fetch detailed order metadata, including grouped tracking information and customer details.
+    """
+    try:
+        cursor = mysql.connection.cursor()
+
+        # Query to fetch grouped order details
+        cursor.execute('''
+            SELECT 
+                o.order_id, 
+                o.status AS order_status,
+                o.date_created AS order_date, 
+                t.product_name, 
+                t.product_size, 
+                t.total_amount, 
+                t.product_quantity, 
+                t.status AS product_status, 
+                t.customer_name, 
+                t.customer_email, 
+                t.customer_contact
+            FROM 
+                orders o
+            LEFT JOIN 
+                track t ON o.order_id = t.order_id
+            ORDER BY 
+                o.date_created DESC
+        ''')
+
+        # Process query results into a grouped structure
+        rows = cursor.fetchall()
+        cursor.close()
+
+        if not rows:
+            return jsonify({"message": "No orders found"}), 404
+
+        grouped_data = {}
+        for row in rows:
+            order_id = row['order_id']
+            if order_id not in grouped_data:
+                grouped_data[order_id] = {
+                    "order_id": order_id,
+                    "status": row['order_status'],
+                    "date_created": row['order_date'],
+                    "customer_name": row['customer_name'],
+                    "customer_email": row['customer_email'],
+                    "customer_contact": row['customer_contact'],
+                    "items": []
+                }
+
+            grouped_data[order_id]["items"].append({
+                "product_name": row['product_name'],
+                "product_size": row['product_size'],
+                "total_amount": row['total_amount'],
+                "product_quantity": row['product_quantity'],
+                "product_status": row['product_status']
+            })
+
+        # Convert grouped_data to a list of orders
+        orders = list(grouped_data.values())
+
+        return jsonify({"orders": orders}), 200
+
+    except Exception as e:
+        print(f"Error fetching order details: {e}")
+        return jsonify({'error': 'An error occurred while fetching order details'}), 500
 
 
 # Update product
